@@ -42,10 +42,13 @@ struct Causal_conv1d_fwd_kernel_traits {
     // BytesToType is a custom templated structure, meant to convert an integer to a corresponding dtype
     // note that here we use 16 bytes -> a vector type uint4
     using vec_t = typename BytesToType<kNBytes * kNElts>::Type;
+    // what is BLOCK_LOAD_WARP_TRANSPOSE?
     using BlockLoadT = cub::BlockLoad<input_t, kNThreads, kNElts, cub::BLOCK_LOAD_WARP_TRANSPOSE>;
+    // meant for loading a vector of size kNThreads
     using BlockLoadVecT = cub::BlockLoad<vec_t, kNThreads, 1, cub::BLOCK_LOAD_DIRECT>;
     using BlockStoreT = cub::BlockStore<input_t, kNThreads, kNElts, cub::BLOCK_STORE_WARP_TRANSPOSE>;
     using BlockStoreVecT = cub::BlockStore<vec_t, kNThreads, 1, cub::BLOCK_STORE_DIRECT>;
+    // zero if using vectorized load
     static constexpr int kSmemIOSize = kIsVecLoad
         ? 0
         : custom_max({sizeof(typename BlockLoadT::TempStorage), sizeof(typename BlockStoreT::TempStorage)});
@@ -53,6 +56,7 @@ struct Causal_conv1d_fwd_kernel_traits {
     static constexpr int kSmemSize = kSmemIOSize + kSmemExchangeSize;
 };
 
+// a block operates over a single sample, single channel, and the entire length
 template<typename Ktraits>
 __global__ __launch_bounds__(Ktraits::kNThreads)
 void causal_conv1d_fwd_kernel(ConvParamsBase params) {
@@ -75,9 +79,13 @@ void causal_conv1d_fwd_kernel(ConvParamsBase params) {
     const int tidx = threadIdx.x;
     const int batch_id = blockIdx.x;
     const int channel_id = blockIdx.y;
+
+    // x is the ptr to the input slice (under the original dtype)
     input_t *x = reinterpret_cast<input_t *>(params.x_ptr) + batch_id * params.x_batch_stride
         + channel_id * params.x_c_stride;
+    // weight is the ptr the conv kernel slice (under the original dtype)
     weight_t *weight = reinterpret_cast<weight_t *>(params.weight_ptr) + channel_id * params.weight_c_stride;
+    // out is the ptr to the output slice (inheriting the input dtype)
     input_t *out = reinterpret_cast<input_t *>(params.out_ptr) + batch_id * params.out_batch_stride
         + channel_id * params.out_c_stride;
     float bias_val = params.bias_ptr == nullptr ? 0.f : float(reinterpret_cast<weight_t *>(params.bias_ptr)[channel_id]);
@@ -88,35 +96,39 @@ void causal_conv1d_fwd_kernel(ConvParamsBase params) {
         smem_exchange[kNThreads - 1] = reinterpret_cast<vec_t *>(zeros)[0];
     }
 
+    // load the kernel weights
     float weight_vals[kWidth];
     #pragma unroll
     for (int i = 0; i < kWidth; ++i) { weight_vals[i] = float(weight[i * params.weight_width_stride]); }
 
-    constexpr int kChunkSize = kNThreads * kNElts;
-    const int n_chunks = (params.seqlen + kChunkSize - 1) / kChunkSize;
-    for (int chunk = 0; chunk < n_chunks; ++chunk) {
-        input_t x_vals_load[2 * kNElts] = {0};
+    constexpr int kChunkSize = kNThreads * kNElts;  // the chunk size processed by the block at once
+    const int n_chunks = (params.seqlen + kChunkSize - 1) / kChunkSize;  // number of chunks
+    for (int chunk = 0; chunk < n_chunks; ++chunk) {  // iterate over the chunks
+        input_t x_vals_load[2 * kNElts] = {0};  // a double buffer
+        // number of valid elements is (seqlen - chunk * kChunkSize) or the length boundary
         if constexpr(kIsVecLoad) {
             typename Ktraits::BlockLoadVecT(smem_load_vec).Load(reinterpret_cast<vec_t*>(x), *reinterpret_cast<vec_t (*)[1]>(&x_vals_load[kNElts]), (params.seqlen - chunk * kChunkSize) / kNElts);
         } else {
             __syncthreads();
             typename Ktraits::BlockLoadT(smem_load).Load(x, *reinterpret_cast<input_t (*)[kNElts]>(&x_vals_load[kNElts]), params.seqlen - chunk * kChunkSize);
         }
-        x += kChunkSize;
+        x += kChunkSize;  // increment the input ptr by chunk size
         __syncthreads();
-        // Thread kNThreads - 1 don't write yet, so that thread 0 can read
-        // the last elements of the previous chunk.
+        
+        // after all said and done
+        // x_vals_load contains the halo in position 0 and current data in position 1
         if (tidx < kNThreads - 1) { smem_exchange[tidx] = reinterpret_cast<vec_t *>(x_vals_load)[1]; }
         __syncthreads();
         reinterpret_cast<vec_t *>(x_vals_load)[0] = smem_exchange[tidx > 0 ? tidx - 1 : kNThreads - 1];
         __syncthreads();
-        // Now thread kNThreads - 1 can write the last elements of the current chunk.
         if (tidx == kNThreads - 1) { smem_exchange[tidx] = reinterpret_cast<vec_t *>(x_vals_load)[1]; }
 
+        // convert the loaded values into float
         float x_vals[2 * kNElts];
         #pragma unroll
         for (int i = 0; i < 2 * kNElts; ++i) { x_vals[i] = float(x_vals_load[i]); }
 
+        // the conv operation
         float out_vals[kNElts];
         #pragma unroll
         for (int i = 0; i < kNElts; ++i) {
@@ -361,7 +373,6 @@ template<int kNThreads, int kWidth, typename input_t, typename weight_t>
 void causal_conv1d_channellast_fwd_launch(ConvParamsBase &params, cudaStream_t stream) {
     BOOL_SWITCH(params.seq_idx_ptr != nullptr, kHasSeqIdx, [&] {
         using Ktraits = Causal_conv1d_channellast_fwd_kernel_traits<kNThreads, kWidth, 64, true, input_t, weight_t>;
-        // constexpr int kSmemSize = Ktraits::kSmemSize;
         constexpr int kChunkSizeL = Ktraits::kChunkSizeL;
         constexpr int kChunkSizeC = Ktraits::kNEltsPerRow;
         const int n_chunks_L = (params.seqlen + kChunkSizeL - 1) / kChunkSizeL;
@@ -369,11 +380,6 @@ void causal_conv1d_channellast_fwd_launch(ConvParamsBase &params, cudaStream_t s
         dim3 grid(params.batch, n_chunks_L, n_chunks_C);
         dim3 block(Ktraits::kNThreads);
         auto kernel = &causal_conv1d_channellast_fwd_kernel<Ktraits, kHasSeqIdx>;
-        // if (kSmemSize >= 48 * 1024) {
-        //     C10_CUDA_CHECK(cudaFuncSetAttribute(
-        //         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
-        //     }
-        // kernel<<<grid, Ktraits::kNThreads, kSmemSize, stream>>>(params);
         kernel<<<grid, Ktraits::kNThreads, 0, stream>>>(params);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     });
