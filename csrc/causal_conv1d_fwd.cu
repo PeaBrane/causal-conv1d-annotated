@@ -18,17 +18,29 @@
 #include "causal_conv1d_common.h"
 #include "static_switch.h"
 
+
+/**
+ * @brief a templated structure for specifying the kernel launch traits
+ * 
+ * @tparam threads per block
+ * @tparam the conv kernel size
+ * @tparam whether to use vectorized loading
+ * @tparam dtype of input
+ * @tparam dtype of conv kernel
+ */
 template<int kNThreads_, int kWidth_, bool kIsVecLoad_, typename input_t_, typename weight_t_>
 struct Causal_conv1d_fwd_kernel_traits {
     using input_t = input_t_;
     using weight_t = weight_t_;
     static constexpr int kNThreads = kNThreads_;
     static constexpr int kWidth = kWidth_;
-    static constexpr int kNBytes = sizeof(input_t);
-    static_assert(kNBytes == 2 || kNBytes == 4);
-    static constexpr int kNElts = kNBytes == 4 ? 4 : 8;
-    static_assert(kWidth <= kNElts);
+    static constexpr int kNBytes = sizeof(input_t);  // size of input in bytes
+    static_assert(kNBytes == 2 || kNBytes == 4);  // fp32 is 4 bytes, and fp16 / bf16 is 2 bytes
+    static constexpr int kNElts = kNBytes == 4 ? 4 : 8;  // guarantees a total of 16 bytes (128 bits)
+    static_assert(kWidth <= kNElts);  // kernel size 
     static constexpr bool kIsVecLoad = kIsVecLoad_;
+    // BytesToType is a custom templated structure, meant to convert an integer to a corresponding dtype
+    // note that here we use 16 bytes -> a vector type uint4
     using vec_t = typename BytesToType<kNBytes * kNElts>::Type;
     using BlockLoadT = cub::BlockLoad<input_t, kNThreads, kNElts, cub::BLOCK_LOAD_WARP_TRANSPOSE>;
     using BlockLoadVecT = cub::BlockLoad<vec_t, kNThreads, 1, cub::BLOCK_LOAD_DIRECT>;

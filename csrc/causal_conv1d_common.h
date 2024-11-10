@@ -46,7 +46,7 @@
 template<int BYTES> struct BytesToType {};
 
 template<> struct BytesToType<16> {
-    using Type = uint4;
+    using Type = uint4;  // uint4 is a vector type in cuda, containing 4 uint32_t
     static_assert(sizeof(Type) == 16);
 };
 
